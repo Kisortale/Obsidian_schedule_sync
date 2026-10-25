@@ -252,4 +252,128 @@ def _assign(tokens: list[str], n: int, warnings: list[str], what: str, ctx: str)
     warnings.append(f"{what}: {len(tokens)} значений на {n} занятий ({ctx})")
     return [tokens[i] if i < len(tokens) else tokens[-1] for i in range(n)]
 
+ 
+ # main API
+@dataclass
+class ParseResult:
+    lessons: list[Lesson]
+    warnings: list[str]                 #для отладки
+    groups: list[str]
+    period: Optional[Period]
+
+
+def parse_schedule(
+    rows: list[list[str]],
+    group: str,
+    today: Optional[date] = None,
+    year: Optional[int] = None,
+) -> ParseResult:                       #гугл таблицы в lesson список
+    today = today or date.today()
+    st = analyze(rows, today, year)     #разбираем шапку таблицы
+    group = normalize(group)
+    if group not in st.groups:          #проверяем есть ли вообще группа в таблице
+        raise ValueError(f"Группа «{group}» не найдена. Доступные: {', '.join(st.groups)}")
+    gcol = st.groups[group]             #номер колонки где лежат занятия нужной группы   
+
+
+    period: Optional[Period] = None    # период модуля — ближайший слева от колонки группы заголовок
+    left = [p for c, p in st.periods if c <= gcol]
+    if left:
+        period = [p for c, p in st.periods if c <= gcol][-1]
+    elif st.periods:
+        period = st.periods[0][1]
+    warnings: list[str] = []
+    if period is None:                   #если не нашли берём сегодня + 60 дней, заглушка чтобы не было ошибки
+        period = Period(today, today + timedelta(days=60))
+        warnings.append("Период модуля в заголовке не найден — взяты ближайшие 60 дней.")
+
+    lessons: dict[tuple, Lesson] = {}
+    cur_day: Optional[int] = None
+    slot: Optional[tuple[str, str]] = None
+
+    def resolve(prefix: str, weekday: int) -> set[date]:
+        out: set[date] = set()
+        for m in DATE_TOKEN_RE.finditer(prefix):
+            frm, d1, m1, d2, m2 = m.groups()
+            try:
+                a = period.make_date(int(d1), int(m1))
+                if d2:
+                    out.update(_weekly(a, period.make_date(int(d2), int(m2)), weekday))
+                elif frm:
+                    out.update(_weekly(a, period.end, weekday))
+                else:
+                    out.add(a)
+            except ValueError:
+                warnings.append(f"Некорректная дата в «{prefix}»")
+        return out
+
+    for r in range(st.header_row + 1, len(rows)):
+        row = rows[r]
+        day_txt = normalize(_cell(row, st.day_col)).lower()
+        if day_txt in DAYS:
+            cur_day = DAYS[day_txt]
+        tm = TIME_RE.search(_cell(row, st.time_col))
+        if not tm:
+            continue
+        slot = (_hm(tm[1], tm[2]), _hm(tm[3], tm[4]))
+        if cur_day is None:
+            continue
+
+        text = _cell(row, gcol)
+        if not normalize(text):
+            continue
+        ctx = f"{['Пн','Вт','Ср','Чт','Пт','Сб','Вс'][cur_day]} {slot[0]}, строка {r + 1}" #для сообщений об ошибке
+        ents = parse_entries(text, warnings)
+        rooms = _assign(normalize(_cell(row, gcol + 1)).split(), len(ents), warnings, "Аудитории", ctx)
+        bld_raw = normalize(_cell(row, gcol + 2)) or normalize(_cell(row, gcol + 3))
+        blds = _assign(bld_raw.split(), len(ents), warnings, "Корпуса", ctx)
+
+        for e, room, bld in zip(ents, rooms, blds):
+            if e.prefix is None:
+                dates = set(_weekly(period.start, period.end, cur_day))
+            else:
+                dates = resolve(e.prefix, cur_day)
+            override: dict[date, tuple[str, str]] = {}              #для конкретных дат (если у занятия своё время)
+            if e.time and e.prefix:
+                for d in resolve(e.prefix, cur_day):
+                    override[d] = e.time
+            for pref, tov in e.time_notes:
+                for d in resolve(pref, cur_day):
+                    override[d] = tov
+            cancelled: set[date] = set()                            # собираем даты с отменой занятия
+            for pref in e.cancel_prefixes:
+                cancelled |= resolve(pref, cur_day)
+
+            online = bld.lower() in ("online", "онлайн")
+            
+            
+            for d in sorted(dates):                                  #cоздадим lesson на каждую дату
+                start, end = override.get(d, slot)
+                notes = []
+                if d in override:
+                    notes.append("время изменено")
+                if d in cancelled:
+                    notes.append("отмена занятия")
+                les = Lesson(
+                    date=d.isoformat(),
+                    slot=slot[0],
+                    start=start,
+                    end=end,
+                    subject=e.subject,
+                    kind=e.kind,
+                    teacher=e.teacher,
+                    room="" if room in ("-", "–", "—") else room,    #нет аудитории
+                    building="online" if online else bld,
+                    building_name="" if online else st.buildings.get(bld, ""),
+                    online=online,
+                    course_code=e.course_code,
+                    note=", ".join(notes),
+                    cancelled=d in cancelled,
+                )
+                lessons[(les.key, les.room, les.teacher)] = les     #cкладываем в словарь
+
+    out = sorted(lessons.values(), key=lambda l: (l.date, l.start, l.subject))   #сортируем - дате/начало/предмет
+    return ParseResult(out, warnings, list(st.groups), period)
+
+
 
